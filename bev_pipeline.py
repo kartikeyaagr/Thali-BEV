@@ -1,18 +1,23 @@
 """
-Warp thali images to a top-down Bird's Eye View automatically.
+Warp thali images to a top-down Bird's Eye View, then run food detection.
 
-Detects the tray boundary — no manual annotation needed.
+Detects the tray boundary automatically (no annotation needed), warps to BEV,
+then runs YOLO compartment detection + ConvNeXt Khana classification.
 
-Output: output/bev/<name>_bev.jpg
-        output/debug/<name>_corners.jpg   (with --debug)
+Output: output/bev/<name>_bev.jpg          — warped top-down image
+        output/detected/<name>_det.jpg     — annotated with food labels
+        output/predictions.json            — all detections as JSON
+        output/debug/<name>_corners.jpg    — tray corners (with --debug)
 
 Usage:
-  uv run bev_pipeline.py                   # all images in images/
-  uv run bev_pipeline.py --image foo.jpg   # single image
-  uv run bev_pipeline.py --debug           # save corner visualisation
+  uv run bev_pipeline.py                    # all images in images/
+  uv run bev_pipeline.py --image foo.jpg    # single image
+  uv run bev_pipeline.py --no-detect        # BEV only, skip detection
+  uv run bev_pipeline.py --debug            # save corner visualisation
 """
 
 import argparse
+import json
 import os
 import cv2
 import numpy as np
@@ -21,8 +26,15 @@ import glob
 
 IMAGE_DIR = "images"
 OUTPUT_BEV = "output/bev"
+OUTPUT_DETECTED = "output/detected"
 OUTPUT_DEBUG = "output/debug"
-DETECT_W = 800  # downsample to this width for detection; scales back at the end
+DETECT_W = 800  # downsample to this width for tray corner detection
+
+DEFAULT_YOLO = "models/thali_detector.pt"
+DEFAULT_CLASSIFIER = "models/best_detection.pt"
+DEFAULT_CLASSES = "data/classes.txt"
+DEFAULT_MODEL_NAME = "convnext_small.fb_in22k_ft_in1k"
+DEFAULT_IMG_SIZE = 320
 
 
 def order_points(pts):
@@ -243,8 +255,33 @@ def warp_to_bev(img, corners, out_w, out_h):
     return cv2.warpPerspective(img, M, (out_w, out_h))
 
 
-def process(image_paths, out_size, debug):
+def load_detector(args):
+    """Lazily load the detection pipeline. Returns None if models are missing."""
+    from src.classifier import KhanaClassifier
+    from src.detector import ThaliDetector
+    from src.pipeline import ThaliPipeline
+
+    class_names = [
+        line.strip()
+        for line in open(args.classes).read().splitlines()
+        if line.strip()
+    ]
+    classifier = KhanaClassifier(
+        model_path=args.classifier,
+        class_names=class_names,
+        model_name=args.model_name,
+        img_size=args.img_size,
+    )
+    detector = ThaliDetector(weights=args.yolo, conf=args.det_conf)
+    return ThaliPipeline(classifier=classifier, detector=detector)
+
+
+def process(image_paths, out_size, debug, pipeline):
     os.makedirs(OUTPUT_BEV, exist_ok=True)
+    if pipeline is not None:
+        os.makedirs(OUTPUT_DETECTED, exist_ok=True)
+
+    all_predictions = {}
 
     for img_path in image_paths:
         name = os.path.basename(img_path)
@@ -274,17 +311,56 @@ def process(image_paths, out_size, debug):
         bev = warp_to_bev(img, corners, out_w, out_h)
         bev_path = os.path.join(OUTPUT_BEV, f"{stem}_bev.jpg")
         cv2.imwrite(bev_path, bev)
-        print(f"[done]  {name} → {bev_path}  "
-              f"({out_w}×{out_h}, ratio={ratio:.2f})")
+        print(f"[bev]   {name} → {bev_path}  ({out_w}×{out_h}, ratio={ratio:.2f})")
+
+        if pipeline is not None:
+            detections = pipeline.run(bev_path)
+            for det in detections:
+                print(f"  {det['label']:<30} conf={det['conf']:.3f}  bbox={det['bbox']}")
+
+            from src.visualize import draw_detections
+            det_path = os.path.join(OUTPUT_DETECTED, f"{stem}_det.jpg")
+            draw_detections(bev_path, detections, det_path)
+
+            all_predictions[name] = [
+                {"label": d["label"], "conf": round(d["conf"], 4), "bbox": d["bbox"]}
+                for d in detections
+            ]
+
+    if pipeline is not None and all_predictions:
+        pred_path = "output/predictions.json"
+        os.makedirs("output", exist_ok=True)
+        with open(pred_path, "w") as f:
+            json.dump(all_predictions, f, indent=2)
+        print(f"\nPredictions saved → {pred_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", help="Process a single image by filename")
     parser.add_argument("--out-size", type=int, default=700,
-                        help="Output square size in pixels (default: 700)")
+                        help="Output canvas size in pixels (default: 700)")
     parser.add_argument("--debug", action="store_true",
                         help="Save corner detection visualisation to output/debug/")
+
+    # Detection flags
+    detect_group = parser.add_mutually_exclusive_group()
+    detect_group.add_argument("--detect", action="store_true", default=True,
+                              help="Run food detection on BEV images (default: on)")
+    detect_group.add_argument("--no-detect", action="store_true",
+                              help="Skip detection — BEV warp only")
+    parser.add_argument("--yolo", default=DEFAULT_YOLO,
+                        help=f"YOLO weights (default: {DEFAULT_YOLO})")
+    parser.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
+                        help=f"ConvNeXt classifier weights (default: {DEFAULT_CLASSIFIER})")
+    parser.add_argument("--classes", default=DEFAULT_CLASSES,
+                        help=f"Classes list file (default: {DEFAULT_CLASSES})")
+    parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME,
+                        help=f"timm model name (default: {DEFAULT_MODEL_NAME})")
+    parser.add_argument("--img-size", type=int, default=DEFAULT_IMG_SIZE,
+                        help=f"Classifier input size (default: {DEFAULT_IMG_SIZE})")
+    parser.add_argument("--det-conf", type=float, default=0.25,
+                        help="YOLO confidence threshold (default: 0.25)")
     args = parser.parse_args()
 
     if args.image:
@@ -300,9 +376,25 @@ def main():
         print(f"No images found in '{IMAGE_DIR}/'")
         return
 
+    run_detect = not args.no_detect
+    pipeline = None
+    if run_detect:
+        missing = [p for p in [args.yolo, args.classifier, args.classes] if not os.path.exists(p)]
+        if missing:
+            print(f"[warn] Detection skipped — missing files: {', '.join(missing)}")
+            print("       Run with --no-detect to suppress this warning.")
+        else:
+            print("Loading detection models...")
+            pipeline = load_detector(args)
+            print("Models loaded.\n")
+
     print(f"Processing {len(image_paths)} image(s)...")
-    process(image_paths, args.out_size, args.debug)
-    print("Done. Results in output/bev/")
+    process(image_paths, args.out_size, args.debug, pipeline)
+    print("\nDone.")
+    print(f"  BEV images   → output/bev/")
+    if pipeline is not None:
+        print(f"  Annotated    → output/detected/")
+        print(f"  Predictions  → output/predictions.json")
 
 
 if __name__ == "__main__":

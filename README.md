@@ -1,21 +1,31 @@
 # Thali BEV
 
-Automatically converts natural-angle thali tray images into a top-down Bird's Eye View (BEV) using perspective transformation. No manual annotation required.
+Automatically converts natural-angle thali tray images into a top-down Bird's Eye View (BEV), then runs food detection and Khana classification on the result. No manual annotation required.
 
-This is Task 3 of a Computer Vision project. The BEV output normalises the viewing angle so a food detection model (Task 2) can run on a consistent top-down representation regardless of how the photo was taken.
+This combines Task 3 (BEV normalisation) and Task 2 (food detection) of a Computer Vision project. Normalising the viewing angle first gives the detector a consistent top-down representation regardless of how the photo was taken.
 
 ## How it works
 
-1. The pipeline detects the 4 corners of the tray in the input image using three strategies tried in order:
-   - **Otsu threshold** — fast; works when the tray is darker than the background (e.g. black plastic tray on white table)
-   - **GrabCut** — slower; works when tray and background share a similar colour (e.g. beige tray on white table) by fitting separate colour models for foreground and background
+### Stage 1 — BEV transformation
+
+1. Detect the 4 corners of the tray using three strategies tried in order:
+   - **Otsu threshold** — fast; works when the tray is darker than the background
+   - **GrabCut** — works when tray and background share a similar colour by fitting separate foreground/background colour models
    - **Canny edges** — fallback for high-contrast rims
 
-2. Each candidate detection is validated — detections that span the whole image (corners at the image boundary) are rejected and the next strategy is tried.
+2. Each candidate is validated — detections that span the whole image (corners at the image boundary) are rejected and the next strategy is tried.
 
 3. The 4 corners are passed to `cv2.getPerspectiveTransform` to compute a homography matrix, then `cv2.warpPerspective` applies it.
 
-4. The output dimensions are estimated from the detected corners so the aspect ratio of the tray is preserved — a 4:3 tray is not squished into a 1:1 square.
+4. Output dimensions are estimated from the detected corners so the tray's true aspect ratio is preserved.
+
+### Stage 2 — Food detection
+
+5. A fine-tuned **YOLO model** (`thali_detector.pt`) detects compartment regions in the BEV image.
+
+6. Each detected crop is classified by a fine-tuned **ConvNeXt** model (`best_detection.pt`) trained to recognise 79 Khana classes (biryani, idli, gulab jamun, etc.).
+
+7. Results are saved as annotated images and a JSON file for evaluation.
 
 ## Setup
 
@@ -30,11 +40,14 @@ uv sync
 Place images (`.jpg`, `.jpeg`, `.png`) in the `images/` directory, then run:
 
 ```bash
-# Process all images
+# Process all images — BEV warp + food detection (default)
 uv run bev_pipeline.py
 
 # Process a single image
 uv run bev_pipeline.py --image foo.jpg
+
+# BEV warp only, skip detection
+uv run bev_pipeline.py --no-detect
 
 # Save corner detection visualisation to output/debug/
 uv run bev_pipeline.py --debug
@@ -43,19 +56,35 @@ uv run bev_pipeline.py --debug
 uv run bev_pipeline.py --out-size 1000
 ```
 
-Output is written to `output/bev/`.
+### Detection options
+
+```bash
+# Adjust YOLO confidence threshold (default: 0.25)
+uv run bev_pipeline.py --det-conf 0.4
+
+# Use custom model paths
+uv run bev_pipeline.py \
+  --yolo models/thali_detector.pt \
+  --classifier models/best_detection.pt \
+  --classes data/classes.txt
+```
 
 ## Output
 
 | Path | Contents |
 |------|----------|
 | `output/bev/<name>_bev.jpg` | Perspective-corrected top-down view |
+| `output/detected/<name>_det.jpg` | BEV image annotated with food labels and bounding boxes |
+| `output/predictions.json` | All detections as JSON (label, confidence, bbox) |
 | `output/debug/<name>_corners.jpg` | Original image with detected corners overlaid (`--debug` only) |
 
 The pipeline prints a status line for each image:
 
 ```
-[done]  IMG_001.jpg → output/bev/IMG_001_bev.jpg  (847×560, ratio=0.81)
+[bev]   IMG_001.jpg → output/bev/IMG_001_bev.jpg  (847×560, ratio=0.81)
+  biryani                        conf=0.909  bbox=[476, 124, 700, 384]
+  garlic naan                    conf=0.908  bbox=[0, 295, 292, 507]
+  gulab jamun                    conf=0.903  bbox=[510, 0, 700, 142]
 [warn]  IMG_002.jpg — shallow angle (ratio=0.42), some stretching expected
 [fail]  IMG_003.jpg — tray not detected (run with --debug to inspect)
 ```
@@ -83,10 +112,23 @@ To use the saved annotations in the pipeline, load `corners.json` and pass the c
 ## Project structure
 
 ```
-images/          Input images
+images/                  Input images
+models/
+  thali_detector.pt      Fine-tuned YOLO for thali compartment detection
+  best_detection.pt      Fine-tuned ConvNeXt for Khana classification
+data/
+  classes.txt            79 Khana class names (one per line)
+src/
+  detector.py            YOLO + contour + colour-seg fallback detector
+  classifier.py          ConvNeXt classifier wrapper
+  pipeline.py            Chains detection → crop → classify
+  preprocess.py          Mean-shift smoothing and CLAHE
+  visualize.py           Draws bounding boxes and labels onto images
 output/
-  bev/           Perspective-corrected outputs
-  debug/         Corner detection visualisations (--debug)
-bev_pipeline.py  Main pipeline — auto-detects corners and warps
-annotate.py      Manual corner annotation tool (fallback)
+  bev/                   Perspective-corrected top-down images
+  detected/              Annotated images with food labels
+  debug/                 Corner detection visualisations (--debug)
+  predictions.json       All detections as JSON
+bev_pipeline.py          Main pipeline — BEV warp then food detection
+annotate.py              Manual corner annotation tool (fallback)
 ```
